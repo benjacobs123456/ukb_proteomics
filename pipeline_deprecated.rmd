@@ -1,0 +1,1851 @@
+---
+title: "UKB proteomics"
+author: "Ben Jacobs"
+date: "05/07/2023"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: yeti
+  
+    
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = T,
+                      warning = F,
+                      root.dir = "~/ukb_proteomics")
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(ROCR))
+suppressPackageStartupMessages(library(RNOmni))
+suppressPackageStartupMessages(library(caret))
+suppressPackageStartupMessages(library(edgeR))
+
+setwd("~/ukb_proteomics/")
+
+```
+# Preamble
+This markdown doc contains the code used to analyse the association between serum protein biomarkers and Multiple Sclerosis. 
+
+# Code
+## Load proteomics data
+````{r, eval = F}
+# wd
+setwd("~/ukb_proteomics")
+
+# read in proteomics data
+dat = read_table("/data/Wolfson-PNU-dementia/UKB/datasets/sheenastrux/78867_General/Proteomics/olink_data.txt")
+
+# stats 
+message("N eids: ",dat %>% distinct(eid) %>% nrow)
+message("N proteins: ",dat %>% distinct(protein_id) %>% nrow)
+
+# filter to baseline only
+dat = dat %>%
+  filter(ins_index == 0)
+
+# get assay details 
+protein_ids = read_tsv("./inputs/coding143.tsv") %>%
+  tidyr::separate(meaning, sep = ";", into = c("protein","full_name")) %>%
+  dplyr::rename("protein_id" = coding)
+dat = dat %>%
+  left_join(protein_ids,by="protein_id")
+
+# get phenotype data 
+pheno = readRDS("/data/Wolfson-PNU-dementia/UKB/datasets/sheenastrux/78867r672482/78867r672482_FO.rds") %>%
+  filter(eid %in% dat$eid) %>%
+  dplyr::select(eid,number_of_proteins_measured_f30900_0_0,plate_used_for_sample_run_f30901_0_0,well_used_for_sample_run_f30902_0_0)
+
+# get LOD
+dat = dat %>%
+  left_join(pheno,
+            by="eid")
+
+# join with LOD 
+lod = read_table("/data/Wolfson-PNU-dementia/UKB/datasets/sheenastrux/78867_General/Proteomics/olink_limit_of_detection.dat") %>%
+  filter(Instance == 0)
+dat = dat %>%
+  dplyr::rename(
+    "PlateID" = plate_used_for_sample_run_f30901_0_0,
+    "Assay" = protein
+  ) %>%
+  left_join(lod,by=c("Assay","PlateID"))
+
+# filter values below LOD as 0
+dat = dat %>%
+  mutate(result_edited = ifelse(result < LOD, 0, result))
+
+# stats 
+message("N eids: ",dat %>% distinct(eid) %>% nrow)
+message("N proteins: ",dat %>% distinct(protein_id) %>% nrow)
+
+# cast to wide format 
+dat_wide = dat %>%
+  dplyr::select(eid,Assay,result_edited) %>%
+  pivot_wider(id_cols = eid, values_from = result_edited, names_from = Assay)
+
+# filter out ppl with ONLY NAs for all proteins
+df_just_proteins = dat_wide %>% dplyr::select(-eid)
+number_nas = rowSums(is.na(df_just_proteins))
+dat_wide$number_nas = number_nas
+dat_wide = dat_wide %>% filter(number_nas!=1463)
+message(nrow(dat_wide))
+
+# save 
+saveRDS(dat_wide,"./outputs/proteomics_wide.rds")
+saveRDS(dat,"./outputs/proteomics_long.rds")
+
+```
+
+## Quality control of proteomics data 
+````{r, eval = F}
+# load libraries
+library(tidyverse)
+
+# wd
+setwd("~/ukb_proteomics")
+
+# read in data 
+dat_wide = readRDS("./outputs/proteomics_wide.rds")
+dat_long = readRDS("./outputs/proteomics_long.rds")
+
+# protein QC 
+df_just_proteins = dat_wide %>% dplyr::select(-eid, -number_nas)
+
+# initialise qc df 
+qc_df = list()
+for(i in c(1:ncol(df_just_proteins))){
+  message(i)
+  this_prot = colnames(df_just_proteins[i])
+  this_prot_data = df_just_proteins %>%
+    dplyr::select(all_of(i))
+  
+  # find n zeros
+  zeros = this_prot_data %>%
+    dplyr::filter(.data[[this_prot]]==0) %>%
+    nrow()
+  nas = this_prot_data %>%
+    dplyr::filter(is.na(.data[[this_prot]])) %>%
+    nrow()
+  qc_df[[i]] = data.frame(this_prot,zeros,nas)
+}
+qc_df = do.call("bind_rows",qc_df)
+
+# plot missingness and zeros per protein 
+qc_df = qc_df %>%
+  mutate(prop_zero = zeros / nrow(df_just_proteins)) %>%
+  mutate(prop_nas = nas / nrow(df_just_proteins))
+
+hist(qc_df$prop_nas)
+summary(qc_df$prop_nas)
+hist(qc_df$prop_zero)
+summary(qc_df$prop_zero)
+
+# get rid of proteins with >10% missingness
+qc_df = qc_df %>%
+  filter(prop_nas <= 0.1 & prop_zero <= 0.2)
+
+# filter main protein df to these 
+dat_wide = dat_wide %>%
+  dplyr::select(eid,all_of(qc_df$this_prot),number_nas)
+
+prot_num = nrow(qc_df)
+
+# missingness by sample
+dat_wide = dat_wide %>%
+  mutate(pct_na = number_nas / prot_num *100)
+dat_wide %>% filter(pct_na > 20) %>% nrow()
+
+# filter out samples with >20% missing values 
+dat_wide = dat_wide %>%
+  filter(pct_na <= 20)
+
+message(nrow(dat_wide))
+message(ncol(dat_wide))
+
+# PCs
+just_proteins = dat_wide %>% dplyr::select(-eid,-number_nas,-pct_na)
+
+# mean imputation
+just_proteins = just_proteins %>%
+  mutate_all(~ifelse(is.na(.x),
+                     mean(.x, na.rm = TRUE),
+                     .x))
+
+# calculate top 50 PCs
+pcs = prcomp(just_proteins, rank = 50,scale. = T, center = T,retx = T)
+
+# add data back in
+top_pcs = pcs$x %>% data.frame()
+dat_wide = dat_wide %>% bind_cols(top_pcs)
+
+ggplot(dat_wide,aes(PC1,PC2))+
+  geom_point()+
+  theme_minimal()
+
+# exclude PC outliers
+dat_wide = dat_wide %>%
+  mutate(mu_pc1 = mean(PC1), 
+         sd_pc1 = sd(PC1))
+
+dat_wide = dat_wide %>%
+  mutate(pc1_outlier = ifelse(
+    (PC1 > mu_pc1 + 5*sd_pc1) |
+      (PC1 < mu_pc1 - 5*sd_pc1),
+    "outlier",
+    "non_outlier"))
+
+
+nrow(dat_wide)
+nrow(qc_df)
+
+# save 
+saveRDS(dat_wide,"./outputs/proteomics_wide_qcd.rds")
+
+
+```
+
+
+## Phenotype processing 
+### Read in data
+```{r pheno}
+
+# setwd 
+setwd("~/ukb_proteomics/")
+
+# read in proteomic data 
+proteins_dat = readRDS("~/ukb_proteomics/outputs/proteomics_wide_qcd.rds")
+
+# read in phenotype data
+pheno = readRDS("/data/Wolfson-PNU-dementia/UKB/datasets/sheenastrux/78867r672482/78867r672482_FO.rds")
+
+cog_data = readRDS("/data/Wolfson-PNU-dementia/UKB/datasets/sheenastrux/78867r672482/UKBW_78867r672482_CogSympt.rds")
+
+cog_data = cog_data %>% dplyr::select(1:12)
+pheno = pheno %>%
+  left_join(cog_data,by="eid")
+
+# get demographics
+data = read_csv("/data/Wolfson-PNU-dementia/UKB/PRS_April_2023/phenodata/PRS_59138r672130.csv")
+data = data %>% dplyr::select(c(1:6))
+
+# merge with proteomic data
+pheno = pheno %>%
+  dplyr::rename("EID" = eid) %>%
+  left_join(data,by="EID") %>%
+  filter(EID %in% proteins_dat$eid) %>%
+  left_join(proteins_dat %>% dplyr::rename("EID" = eid),
+            by="EID")
+
+# define pseudo-dob
+pheno = pheno %>%
+  mutate(dob = as.Date(
+           paste0(year_of_birth_f34_0_0,"-01-01"),
+           format = "%Y-%m-%d"
+  ))
+ 
+# define function to get prevalent and incident code
+define_incident_prevalent_disease = function(
+  age_col,
+  disease_col,
+  date_col_input,
+  src_col_input
+){
+
+  dat = pheno %>%
+  mutate(
+    agecol = (as.Date(.data[[date_col_input]],format = "%Y-%m-%d") - dob) /
+      365.25
+    ) %>%
+  mutate(
+    discol = case_when(
+      !is.na(.data[[src_col_input]]) & (is.na(agecol) | agecol < 10) ~ as.character("NA"),
+      !is.na(.data[[src_col_input]]) & agecol <= (age_at_recruitment_f21022_0_0 + 10) ~ "prevalent",
+      !is.na(.data[[src_col_input]]) & agecol > (age_at_recruitment_f21022_0_0 + 10) ~ "incident",
+      is.na(.data[[src_col_input]]) ~ "control"
+  )) 
+  
+  dat = dat %>%
+    mutate(agecol = ifelse(discol=="NA",NA,agecol)) %>%
+    mutate(discol = ifelse(discol=="NA",NA,discol))  
+  
+  dat[[age_col]] = dat$agecol
+  dat[[disease_col]] = dat$discol
+
+  dat = dat %>%  
+    dplyr::select(-agecol,-discol)
+  
+  message(disease_col)
+  dat %>% 
+    dplyr::count(.data[[disease_col]]) %>%
+    print()
+  pheno <<- dat
+
+}
+```
+
+### Get disease codes
+```{r dis_codes}
+# define phenotypes 
+define_incident_prevalent_disease(age_col = "age_at_ms",
+                                  disease_col = "MS_status",
+                                  date_col_input = "date_g35_first_reported_multiple_sclerosis_f131042_0_0",
+                                  src_col_input = "source_of_report_of_g35_multiple_sclerosis_f131043_0_0")
+
+
+hist(pheno$age_at_ms)
+summary(pheno$age_at_ms)
+define_incident_prevalent_disease(age_col = "age_at_pd",
+                                  disease_col = "PD_status",
+                                  date_col_input = "date_g20_first_reported_parkinsons_disease_f131022_0_0",
+                                  src_col_input = "source_of_report_of_g20_parkinsons_disease_f131023_0_0")
+
+
+define_incident_prevalent_disease(age_col = "age_at_sle",
+                                  disease_col = "SLE_status",
+                                  date_col_input = "date_m32_first_reported_systemic_lupus_erythematosus_f131894_0_0",
+                                  src_col_input = "source_of_report_of_m32_systemic_lupus_erythematosus_f131895_0_0")
+
+define_incident_prevalent_disease(age_col = "age_at_ankspond",
+                                  disease_col = "AS_status",
+                                  date_col_input = "date_m45_first_reported_ankylosing_spondylitis_f131912_0_0",
+                                  src_col_input = "source_of_report_of_m45_ankylosing_spondylitis_f131913_0_0")
+
+
+define_incident_prevalent_disease(age_col = "age_at_coeliac",
+                                  disease_col = "COELIAC_status",
+                                  date_col_input = "date_k90_first_reported_intestinal_malabsorption_f131688_0_0",
+                                  src_col_input = "source_of_report_of_k90_intestinal_malabsorption_f131689_0_0")
+
+define_incident_prevalent_disease(age_col = "age_at_cd",
+                                  disease_col = "CROHNS_status",
+                                  date_col_input = "date_k50_first_reported_crohns_disease_regional_enteritis_f131626_0_0",
+                                  src_col_input = "source_of_report_of_k50_crohns_disease_regional_enteritis_f131627_0_0")
+
+define_incident_prevalent_disease(age_col = "age_at_uc",
+                                  disease_col = "UC_status",
+                                  date_col_input = "date_k51_first_reported_ulcerative_colitis_f131628_0_0",
+                                  src_col_input = "source_of_report_of_k51_ulcerative_colitis_f131629_0_0")
+
+define_incident_prevalent_disease(age_col = "age_at_ra",
+                                  disease_col = "RA_status",
+                                  date_col_input = "date_m05_first_reported_seropositive_rheumatoid_arthritis_f131848_0_0",
+                                  src_col_input = "source_of_report_of_m05_seropositive_rheumatoid_arthritis_f131849_0_0")
+
+define_incident_prevalent_disease(age_col = "age_at_psor",
+                                  disease_col = "PSORIASIS_status",
+                                  date_col_input = "date_l40_first_reported_psoriasis_f131742_0_0",
+                                  src_col_input = "source_of_report_of_l40_psoriasis_f131743_0_0")
+
+define_incident_prevalent_disease(age_col = "age_at_ad",
+                                  disease_col = "AD_status",
+                                  date_col_input = "date_g30_first_reported_alzheimers_disease_f131036_0_0",
+                                  src_col_input = "source_of_report_of_g30_alzheimers_disease_f131037_0_0")
+
+define_incident_prevalent_disease(age_col = "age_at_mnd",
+                                  disease_col = "MND_status",
+                                  date_col_input = "date_g12_first_reported_spinal_muscular_atrophy_and_related_syndromes_f131016_0_0",
+                                  src_col_input = "source_of_report_of_g12_spinal_muscular_atrophy_and_related_syndromes_f131017_0_0")
+
+```
+
+### Get counts of diseases 
+```{r dis_counts}
+disease_counts = pheno %>% 
+  dplyr::select(contains("_status"),-contains("source"),-contains("date")) %>%
+  pivot_longer(cols = everything()) %>%
+  dplyr::count(name,value) %>%
+  mutate(name = str_remove_all(name,"_status")) %>%
+  filter(value != "control") %>%
+  group_by(name) %>%
+  mutate(total = sum(n)) %>%
+  ungroup() %>%
+  arrange(total)
+disease_counts$name = factor(disease_counts$name,levels = unique(disease_counts$name),ordered = T) 
+p = ggplot(disease_counts,aes(name,n,fill=value))+
+  geom_col(color="black")+
+  theme_minimal()+
+  scale_fill_brewer(palette="Set1")+
+  labs(x="Disease",y="N",fill="Date of report")+
+  coord_flip()
+
+
+p
+png("~/ukb_proteomics/outputs/disease_counts.png",res=900,units="in",width=4,height=4)
+p
+dev.off()
+
+```
+
+
+### Define prevalent MS vs healthy controls
+```{r prevalent_cases}
+pheno = pheno %>%
+  mutate(MS_disease_status = ifelse(
+    MS_status == "incident" |
+      RA_status != "control" | 
+  AS_status!="control" |
+  CROHNS_status!="control" | 
+  COELIAC_status!="control" |
+  SLE_status!="control" |
+  UC_status!="control" |
+  PSORIASIS_status!="control" |
+  AD_status!="control" |
+  PD_status!="control" |
+  MND_status!="control",
+  NA,
+  MS_status))
+
+nrow(pheno)
+table(pheno$MS_status)
+sum(table(pheno$MS_status))
+
+table(pheno$MS_disease_status)
+
+# bring in other data fields
+additional_data = read_csv("/data/Wolfson-PNU-dementia/UKB/PRS_April_2023/phenodata/PRS_59138r672130.csv")
+additional_data = additional_data %>% dplyr::select(EID,genetic_ethnic_grouping_f22006_0_0,contains("principal_components"))
+pheno = pheno %>% left_join(additional_data,by="EID")
+
+# EUR
+# df = df %>% filter(genetic_ethnic_grouping_f22006_0_0 == "Caucasian")
+
+# bring in proteomics assay information
+assay_info = read_tsv("/data/Wolfson-PNU-dementia/UKB/datasets/sheenastrux/78867_General/Proteomics/olink_assay.dat")
+batch_numbers= read_tsv("/data/Wolfson-PNU-dementia/UKB/datasets/sheenastrux/78867_General/Proteomics/olink_batch_number.dat")
+pheno = pheno %>%
+  dplyr::rename("PlateID" = plate_used_for_sample_run_f30901_0_0) %>%
+  left_join(batch_numbers,by="PlateID")
+
+# remove COVID and pilot batches
+table(pheno$Batch,pheno$MS_disease_status)
+unused_batches = pheno %>%
+  filter(Batch %in% c(0,7))
+table(pheno$Batch)
+nrow(unused_batches)
+pheno = pheno %>%
+  filter(!Batch %in% c(0,7))
+nrow(pheno)
+table(pheno$Batch)
+table(pheno$MS_status)
+table(unused_batches$MS_disease_status)
+
+# see how many excluded due to NDD / autoimmune 
+pheno = pheno %>%
+  mutate(ndd_status = ifelse(
+    AD_status != "control" | PD_status != "control" | MND_status != "control",
+    1,
+    0
+  )) 
+pheno = pheno %>%
+  mutate(ai_status = ifelse(
+    SLE_status != "control" | 
+      AS_status != "control" | 
+      COELIAC_status != "control" |
+      CROHNS_status != "control" | 
+      UC_status != "control" | 
+      RA_status != "control" | 
+      PSORIASIS_status != "control"
+      ,
+    1,
+    0
+  )) 
+
+# filter out controls with AI disease / NDDs
+nrow(pheno)
+pheno %>% 
+  filter(is.na(MS_status) |
+           is.na(ai_status) | 
+           is.na(ndd_status)) %>%
+  nrow()
+
+filtered_pheno = pheno %>% 
+  filter(!is.na(MS_status) &
+           !is.na(ai_status) & 
+           !is.na(ndd_status))
+nrow(filtered_pheno)
+
+table(filtered_pheno$ndd_status,filtered_pheno$MS_status)
+filtered_pheno = filtered_pheno %>%
+  filter(!(MS_status=="control" & ndd_status == 1))
+
+table(filtered_pheno$ai_status,filtered_pheno$MS_status)
+filtered_pheno = filtered_pheno %>%
+  filter(!(MS_status=="control" & ai_status == 1))
+
+table(filtered_pheno$MS_status)
+filtered_pheno = filtered_pheno %>%
+  filter(MS_status!="incident")
+table(filtered_pheno$MS_status)
+
+nrow(filtered_pheno)
+
+filtered_pheno %>%
+  filter(MS_status == "prevalent" & !is.na(volume_of_brain_greywhite_matter_normalised_for_head_size_f25009_2_0)) %>%
+  nrow()
+
+filtered_pheno %>%
+ filter(!is.na(volume_of_brain_greywhite_matter_normalised_for_head_size_f25009_2_0)) %>%
+  dplyr::count(MS_status)
+
+```
+
+### Demographics
+```{r}
+filtered_pheno %>%
+  dplyr::count(MS_status)
+filtered_pheno %>%
+  group_by(MS_status) %>%
+  summarise(med_age = median(age_at_recruitment_f21022_0_0,na.rm = T),
+            iqr_age = IQR(age_at_recruitment_f21022_0_0,na.rm = T),
+            med_bmi = median(body_mass_index_bmi_f21001_0_0,na.rm = T),
+            iqr_bmi = IQR(body_mass_index_bmi_f21001_0_0,na.rm = T),
+            med_town = median(townsend_deprivation_index_at_recruitment_f22189_0_0,na.rm=T),
+          iqr_town = IQR(townsend_deprivation_index_at_recruitment_f22189_0_0,na.rm=T),
+          med_age_at_ms = median(age_at_ms,na.rm=T),
+          iqr_age_at_ms = IQR(age_at_ms,na.rm=T)) %>%
+  t()
+filtered_pheno %>%
+  group_by(MS_status) %>%
+  dplyr::count(sex_f31_0_0) %>%
+  mutate(prop = n/sum(n))
+
+filtered_pheno %>%
+  group_by(MS_status) %>%
+  dplyr::count(ethnic_background_f21000_0_0) %>%
+  mutate(prop = n/sum(n)) %>%
+  arrange(desc(prop))
+
+filtered_pheno %>%
+  group_by(MS_status) %>%
+  dplyr::count(Batch) %>%
+  mutate(prop = n/sum(n)) %>%
+  arrange(desc(prop))
+
+filtered_pheno %>%
+  dplyr::select(source_of_report_of_g35_multiple_sclerosis_f131043_0_0) %>%
+  filter(!is.na(source_of_report_of_g35_multiple_sclerosis_f131043_0_0)) %>%
+  mutate(just_one_source = ifelse(grepl("only",source_of_report_of_g35_multiple_sclerosis_f131043_0_0),
+                                  "only_one",
+                                  "more_than_one")) %>%
+  dplyr::count(just_one_source) %>%
+  mutate(prop = n/sum(n)) %>%
+  arrange(desc(prop)) 
+
+
+# functions for simple comparisons 
+
+do_wilcox_test = function(var){
+  
+  a = filtered_pheno[filtered_pheno$MS_status=="control",][[var]]
+  b = filtered_pheno[filtered_pheno$MS_status=="prevalent",][[var]]
+  wilcox.test(a,b)$p.value
+}
+
+do_wilcox_test("age_at_recruitment_f21022_0_0")
+do_wilcox_test("body_mass_index_bmi_f21001_0_0")
+do_wilcox_test("townsend_deprivation_index_at_recruitment_f22189_0_0")
+
+var = "sex_f31_0_0"
+do_chisq_test = function(var){
+  
+  tbl = table(filtered_pheno[[var]],filtered_pheno$MS_status)
+  chisq.test(tbl)$p.value
+}
+
+do_chisq_test("sex_f31_0_0")
+do_chisq_test("ethnic_background_f21000_0_0")
+
+```
+
+### Visualise demographics 
+```{r dem_viz}
+
+make_grouped_density_plot = function(phenocol){
+  
+  ggplot(
+    filtered_pheno,
+    aes(.data[[phenocol]],fill=MS_status)
+  ) +
+    geom_density(alpha=0.5)+
+    theme_minimal()+
+    scale_fill_brewer(palette="Set1")
+}
+
+
+make_grouped_density_plot("age_at_recruitment_f21022_0_0")
+make_grouped_density_plot("body_mass_index_bmi_f21001_0_0")
+make_grouped_density_plot("townsend_deprivation_index_at_recruitment_f22189_0_0")
+make_grouped_density_plot("age_at_ms")
+
+make_grouped_bar_plot = function(phenocol){
+  
+  ggplot(
+    filtered_pheno,
+    aes(MS_status,fill=factor(.data[[phenocol]]))
+  ) +
+    geom_bar(position="fill",color="black")+
+    theme_minimal()
+}
+
+
+make_grouped_bar_plot("sex_f31_0_0")
+make_grouped_bar_plot("ethnic_background_f21000_0_0")
+make_grouped_bar_plot("Batch")
+
+```
+
+## Case-control regression models
+
+### Primary analysis
+```{r case_cont}
+
+# make function for regression
+protein_list = colnames(proteins_dat)[c(2:1287)]
+n_prot = length(protein_list)
+
+run_limma = function(phenotype_col, limma_dat = pheno, plot_prefix = "full", model_spec = "primary"){
+dat = limma_dat %>% 
+  filter(!is.na(sex_f31_0_0) & !is.na(age_when_attended_assessment_centre_f21003_0_0) & !is.na(.data[[phenotype_col]]))
+
+dat_just_proteins = dat %>% dplyr::select(all_of(protein_list))
+
+dat$agesq = dat$age_when_attended_assessment_centre_f21003_0_0^2 
+dat$Batch = factor(dat$Batch)
+
+
+# set row names
+rownames(dat_just_proteins) = dat$EID
+
+# mean imputation
+dat_just_proteins = dat_just_proteins %>% 
+  mutate_all(~ifelse(is.na(.x), 
+                     mean(.x, na.rm = TRUE), .x))
+
+# rank INT
+# sens check
+# dat_just_proteins = dat_just_proteins %>% mutate_all(RNOmni::RankNorm)
+
+# design 
+
+primary = formula(
+  paste0("~0 + ",phenotype_col," + Batch + age_when_attended_assessment_centre_f21003_0_0 + sex_f31_0_0 + age_when_attended_assessment_centre_f21003_0_0:sex_f31_0_0 + agesq + agesq:sex_f31_0_0")
+  )
+
+bmi = formula(
+  paste0("~0 + ",phenotype_col," + Batch + body_mass_index_bmi_f21001_0_0 + age_when_attended_assessment_centre_f21003_0_0 + sex_f31_0_0 + age_when_attended_assessment_centre_f21003_0_0:sex_f31_0_0 + agesq + agesq:sex_f31_0_0")
+  )
+
+agesex = formula(
+  paste0("~0 + ",phenotype_col," + age_when_attended_assessment_centre_f21003_0_0 + sex_f31_0_0 + age_when_attended_assessment_centre_f21003_0_0:sex_f31_0_0 + agesq + agesq:sex_f31_0_0")
+  )
+
+design <- model.matrix(get(model_spec), dat)
+message("Running model spec:")
+message(get(model_spec))
+colnames(design) = str_remove_all(colnames(design),phenotype_col)
+colnames(design)[ncol((design))-1]="agesex"
+colnames(design)[ncol((design))]="agesq_sex"
+fit = lmFit(t(dat_just_proteins), design) # fit model 
+contr <- makeContrasts(
+  prevalent  - control , 
+  levels = design) # contrast 
+tmp <- contrasts.fit(fit, contr) # Estimate contrast for each protein
+tmp <- eBayes(tmp) # EB smooth
+
+
+# process results
+pvals = tmp$p.value %>%
+  data.frame() %>%
+  mutate(protein = rownames(tmp$p.value)) 
+colnames(pvals) = c("pval","protein")
+betas = tmp$coefficients %>%
+  data.frame() %>%
+  mutate(protein = rownames(tmp$coefficients))
+colnames(betas) = c("beta","protein")
+
+overall_res = betas %>% left_join(pvals,by="protein") %>%
+  mutate(fdr = p.adjust(pval,method="fdr"),
+         bonf = p.adjust(pval,method="bonf")
+         )
+
+short_pheno = str_remove_all(phenotype_col,"_status")
+plot_dat = overall_res %>%
+  mutate(sig = case_when(
+    bonf < 0.05 & beta > 0 ~ paste0("Up in ",short_pheno),
+    bonf < 0.05 & beta < 0 ~ paste0("Down in ",short_pheno),
+    bonf >= 0.05 ~ "NS"))
+
+counts = dat %>%
+  dplyr::count(.data[[phenotype_col]])
+
+p = ggplot(plot_dat,
+            aes(beta,-log10(pval),col = sig))+
+  geom_point()+
+  scale_color_manual(values = c("blue","grey","red"))+
+  theme_minimal()+
+  ggrepel::geom_text_repel(data = plot_dat %>% filter(bonf < 0.05),
+                           mapping = aes(beta, -log10(pval),label = protein),show.legend = F,force = 20)+
+  ggtitle(paste0("Prevalent ",
+                 short_pheno,
+                 "\n",
+                 counts[counts[[phenotype_col]]=="prevalent",]$n,
+                 " cases",
+                 "\n",
+                 counts[counts[[phenotype_col]]=="control",]$n,
+                 " controls"))+
+  labs(x="Beta coefficient",y = "-log10(P)",col="Direction")
+p
+
+write_csv(overall_res,paste0("~/ukb_proteomics/outputs/limma_results_",plot_prefix,"_",phenotype_col,".csv"))
+write_csv(overall_res %>%
+            filter(bonf < 0.05) %>%
+            arrange(desc(beta)),paste0("~/ukb_proteomics/outputs/sig_limma_results_",plot_prefix,"_",phenotype_col,".csv"))
+
+plotout = paste0("~/ukb_proteomics/outputs/limma_results_",plot_prefix,"_",phenotype_col,".png")
+png(plotout,res=900,units="in",width=6,height=4)
+
+print(p)
+dev.off()
+print(p)
+
+
+}
+
+
+
+# primary analysis
+run_limma(phenotype_col = "MS_status", 
+          limma_dat = filtered_pheno, 
+          plot_prefix = "filtered",
+          model_spec = "primary")
+
+
+
+# adjust for bmi
+run_limma(phenotype_col = "MS_status", 
+          limma_dat = filtered_pheno %>%
+            filter(!is.na(body_mass_index_bmi_f21001_0_0)), 
+          plot_prefix = "filtered_bmi",
+          model_spec = "bmi")
+
+```
+
+### Case-control matching 
+```{r match}
+# do matching on age and sex (1:4)
+ms_only = filtered_pheno %>% filter(MS_status == "prevalent")
+controls_only = filtered_pheno %>% filter(MS_status=="control")
+matched_controls = data.frame()
+
+for(i in c(1:nrow(ms_only))){
+  this_case = ms_only[i,]
+  message(i)
+  controls = controls_only %>%
+    filter(
+      age_at_recruitment_f21022_0_0 == this_case$age_at_recruitment_f21022_0_0 & 
+        sex_f31_0_0 == this_case$sex_f31_0_0) %>%
+    filter(!EID %in% matched_controls$EID) %>%
+    sample_n(size = 4) 
+  matched_controls <<- bind_rows(matched_controls, controls)
+}
+
+# combine 
+matched_dataset = bind_rows(ms_only,matched_controls)
+table(matched_dataset$MS_status)
+
+# matched analysis
+run_limma(phenotype_col = "MS_status", 
+          limma_dat = matched_dataset, 
+          plot_prefix = "matched",
+          model_spec = "primary")
+
+```
+
+### Validation set 
+```{r validation}
+
+# matched analysis
+unused_batches = unused_batches %>%
+  mutate(ndd_status = ifelse(
+    AD_status != "control" | PD_status != "control" | MND_status != "control",
+    1,
+    0
+  )) 
+unused_batches = unused_batches %>%
+  mutate(ai_status = ifelse(
+    SLE_status != "control" | 
+      AS_status != "control" | 
+      COELIAC_status != "control" |
+      CROHNS_status != "control" | 
+      UC_status != "control" | 
+      RA_status != "control" | 
+      PSORIASIS_status != "control"
+      ,
+    1,
+    0
+  )) 
+
+# filter out controls with AI disease / NDDs
+unused_batches = unused_batches %>% 
+  filter(!is.na(MS_status) &
+           !is.na(ai_status) & 
+           !is.na(ndd_status)) %>%
+  filter(!(MS_status=="control" & ndd_status == 1)) %>%
+  filter(!(MS_status=="control" & ai_status == 1)) %>%
+  filter(MS_status!="incident")
+
+# run limma
+run_limma(phenotype_col = "MS_disease_status", 
+          limma_dat = unused_batches, 
+          plot_prefix = "validation",
+          model_spec = "agesex")
+
+table(unused_batches$Batch)
+```
+
+### Make tables
+```{r tables}
+# combine tables to make supp table 1
+
+a = read_csv("~/ukb_proteomics/outputs/limma_results_filtered_MS_status.csv") %>%
+  mutate(model = "primary_analysis")
+b = read_csv("~/ukb_proteomics/outputs/limma_results_filtered_bmi_MS_status.csv") %>%
+  mutate(model = "bmi")
+c = read_csv("~/ukb_proteomics/outputs/limma_results_matched_MS_status.csv") %>%
+  mutate(model = "matched")
+d = read_csv("~/ukb_proteomics/outputs/limma_results_validation_MS_disease_status.csv") %>%
+  mutate(model = "validation")
+
+
+all_res = bind_rows(a,b,c,d) %>%
+  pivot_wider(id_cols = protein, 
+              names_from = model,
+              values_from = c(beta, pval, fdr, bonf))
+
+all_res = all_res %>% 
+            arrange(pval_primary_analysis) %>%
+            dplyr::select(
+              1,2,6,10,14,
+              3,7,11,15,
+              4,8,12,16,
+              5,9,13,17
+            )
+
+
+all_res = all_res %>%
+  mutate(
+    replicated = ifelse(
+      bonf_primary_analysis < 0.05 & bonf_bmi < 0.05 & pval_matched < 0.05 & pval_validation < 0.05 &
+        sign(beta_primary_analysis) == sign(beta_bmi) &
+        sign(beta_primary_analysis) == sign(beta_matched) &
+        sign(beta_primary_analysis) == sign(beta_validation) ,
+      "*",
+      " ")
+    )
+
+write_csv(all_res,"~/ukb_proteomics/outputs/all_results.csv")
+
+
+```
+
+### Independent effects 
+```{r, eval=F}
+
+# fit joint model to main dataset 
+ms_sig_prots = a %>% filter(bonf<0.05)
+model_dat = filtered_pheno %>%
+  dplyr::select(MS_disease_status,
+                all_of(ms_sig_prots$protein),
+                sex_f31_0_0 ,
+                age_at_recruitment_f21022_0_0) 
+
+# impute missing proteins 
+
+dat_just_proteins = model_dat %>% dplyr::select(all_of(ms_sig_prots$protein))
+
+# mean imputation
+dat_just_proteins = dat_just_proteins %>% 
+  mutate_all(~ifelse(is.na(.x), 
+                     mean(.x, na.rm = TRUE), .x))
+
+# join together
+model_dat = model_dat %>% 
+  dplyr::select(-all_of(ms_sig_prots$protein)) %>%
+  bind_cols(dat_just_proteins)
+  
+# relevel disease status
+model_dat$disease_status = relevel(factor(model_dat$MS_disease_status),ref="control")
+
+# make formula
+formula = paste0("disease_status ~ sex_f31_0_0 + age_at_recruitment_f21022_0_0 + age_at_recruitment_f21022_0_0^2 + age_at_recruitment_f21022_0_0:sex_f31_0_0 + age_at_recruitment_f21022_0_0^2:sex_f31_0_0 +",
+                 paste0(ms_sig_prots$protein,collapse = "+"))
+null_formula = paste0("disease_status ~ sex_f31_0_0 + age_at_recruitment_f21022_0_0 + age_at_recruitment_f21022_0_0^2 + age_at_recruitment_f21022_0_0:sex_f31_0_0 + age_at_recruitment_f21022_0_0^2:sex_f31_0_0")
+
+# regression
+model = glm(data = model_dat,formula,family = binomial(link="logit"))
+null_model = glm(data = model_dat,null_formula,family = binomial(link="logit"))
+
+car::vif(model, terms = "marginal") %>% data.frame() %>% dplyr::rename("vif" = ".") %>% arrange(desc(vif))
+
+# stepwise selection 
+step_results = MASS::stepAIC(null_model,
+                             scope = formula,
+              direction = "forward",
+              steps = 1000,
+              trace = T)
+
+step_results
+car::vif(step_results, terms = "marginal") %>% data.frame() %>% dplyr::rename("vif" = ".") %>% arrange(desc(vif))
+
+```
+
+
+### Prediction/classification
+```{r, eval=F}
+# Get vif of stepwise model
+car::vif(step_results)
+
+coefs = summary(step_results)$coefficients %>%
+  data.frame()
+coefs$var = rownames(coefs)
+rownames(coefs) = NULL
+stepwise_coefs = coefs %>% 
+  filter(  !grepl("^sex",var) & 
+           !grepl("^age_at",var) & 
+           !grepl("Intercept",var)) %>%
+  dplyr::rename("pval" = `Pr...z..`,
+                "se" = `Std..Error`) %>%
+  dplyr::select(var,Estimate,se,pval) %>%
+  arrange(pval) %>%
+  mutate(sig = ifelse(pval < 0.05, "*"," "))
+
+write_csv(stepwise_coefs,"~/ukb_proteomics/outputs/stepwise_model.csv")
+
+# apply to witheld batches
+model_dat2 = unused_batches %>%
+  dplyr::select(MS_disease_status,
+                all_of(ms_sig_prots$protein),
+                sex_f31_0_0 ,
+                age_at_recruitment_f21022_0_0) 
+
+# impute missing proteins 
+dat_just_proteins = model_dat2 %>% dplyr::select(all_of(ms_sig_prots$protein))
+
+# mean imputation
+dat_just_proteins = dat_just_proteins %>% 
+  mutate_all(~ifelse(is.na(.x), 
+                     mean(.x, na.rm = TRUE), .x))
+
+# join together
+model_dat2 = model_dat2 %>% 
+  dplyr::select(MS_disease_status,
+                sex_f31_0_0 ,
+                age_at_recruitment_f21022_0_0) %>%
+  bind_cols(dat_just_proteins) %>%
+  na.omit()
+  
+# relevel disease status
+model_dat2$disease_status = relevel(factor(model_dat2$MS_disease_status),ref="control")
+
+# predict 
+predictions = predict(step_results,newdata = model_dat2,type = "response")
+null_predictions = predict(null_model,newdata = model_dat2,type = "response")
+
+# ROC 
+preds = ROCR::prediction(predictions = list(predictions,null_predictions),list(model_dat2$MS_disease_status,model_dat2$MS_disease_status))
+perf = ROCR::performance(preds,"tpr","fpr")
+auc = ROCR::performance(preds,measure = "auc")@y.values
+auc_label = paste0(
+  "Full model AUC: ",round(auc[[1]],2),"\n",
+  "Null model AUC: ",round(auc[[2]],2)
+)
+
+plot_df = data.frame(
+  x = c(perf@x.values[[1]],perf@x.values[[2]]),
+  y = c(perf@y.values[[1]],perf@y.values[[2]]),
+  model = c(
+    rep("Full",length(perf@x.values[[1]])),
+    rep("Null",length(perf@x.values[[2]]))
+  )
+)
+
+
+p3 = ggplot(plot_df,aes(x,y,col=model))+
+  geom_line()+
+  theme_minimal()+
+  geom_abline(slope = 1,intercept=0,linetype = "dashed",alpha=0.3)+
+  labs(x="TPR",y="FPR")+
+  scale_color_brewer(palette="Set1")+
+  annotate("text",x=0.75,y=0.1,label = auc_label)
+
+png("~/ukb_proteomics/outputs/roc_plot.png",res=600,units="in",width=4,height=4)
+p3
+dev.off()
+
+p3
+
+# find best cutoff
+preds2 = ROCR::prediction(predictions = predictions,
+                          model_dat2$MS_disease_status)
+
+perf2 = ROCR::performance(preds2,"acc")
+
+plot(perf2)
+best_cutoff = data.frame(
+  cutoff = perf2@x.values[[1]],
+  accuracy = perf2@y.values[[1]]
+) %>% arrange(desc(accuracy)) %>%
+  filter(cutoff != "Inf")
+message(best_cutoff$cutoff[1])
+
+# precision - recall 
+
+# precision = PPV 
+
+f1_scores = list()
+for(cutoff in seq(0.0001,0.323,by=0.0001)){
+message(cutoff)
+model_dat2 = model_dat2 %>%
+  mutate(preds = predictions) %>%
+  mutate(predicted_case_status = ifelse(
+    predictions < cutoff,
+    "control",
+    "prevalent"
+  ))
+
+conf_mat1 = table(factor(model_dat2$MS_disease_status),
+                factor(model_dat2$predicted_case_status))
+
+# precision = PPV = TP / TP + FP
+tp = conf_mat1[2,2]
+fp = conf_mat1[1,2]
+fn = conf_mat1[2,1]
+tn = conf_mat1[1,1]
+
+precision = tp / (tp + fp)
+# recall = sensitivity = TP / TP + FN
+recall = tp / (tp + fn)
+
+# f1 
+f1 =   ( (precision * recall) /
+  (precision + recall) ) * 2
+
+# specificity 
+spec = tn / (tn + fp)
+
+npv = tn / (tn + fn)
+
+f1_scores[[length(f1_scores)+1]] =
+  data.frame(cutoff,f1,precision,recall,spec,npv)
+}
+
+
+# find best f1 score
+f1_scores = do.call("bind_rows",f1_scores) %>%
+  arrange(desc(f1)) %>%
+  head(20)
+f1_scores
+
+```
+
+### Elastic net
+```{r, eval = F}
+
+# split train and test
+model_dat = matched_dataset %>%
+  dplyr::select(EID,
+                MS_disease_status,
+                all_of(protein_list),
+                sex_f31_0_0 ,
+                age_at_recruitment_f21022_0_0) 
+
+training = sample_n(model_dat, size = nrow(model_dat) * 0.7)
+testing = model_dat %>% filter(EID %in% training$EID)
+
+
+# impute missing proteins 
+training = training %>% 
+  dplyr::select(all_of(protein_list)) %>% 
+  mutate_all(~ifelse(is.na(.x), 
+                     mean(.x, na.rm = TRUE), .x)) %>% 
+  bind_cols(training %>%
+                dplyr::select(-all_of(protein_list))
+              ) %>%
+  na.omit()
+
+# relevel disease status
+training$MS_disease_status = relevel(factor(training$MS_disease_status),ref="control")
+
+# drop EID
+training = training %>% dplyr::select(-EID)
+
+# train 
+cv1 = trainControl(method="cv",number = 2)
+lasso_model = caret::train(
+      data = training,
+      MS_disease_status ~ ., 
+      trainControl = cv1,
+      method = "glmnet")
+
+# conf matrix
+confusionMatrix(lasso_model)
+
+# get coefs 
+get_best_model = function(lasso_model){
+best_params = lasso_model$results[rownames(lasso_model$results) == rownames(lasso_model$bestTune),]
+print(best_params)
+coef(lasso_model$finalModel,lasso_model$bestTune$lambda) %>%
+  as.data.frame.matrix() %>%
+  arrange(desc(abs(s1))) %>%
+  filter(s1 != 0)
+}
+get_best_model(lasso_model)
+
+
+# prediction 
+
+# impute missing proteins 
+testing = testing %>% 
+  dplyr::select(all_of(protein_list)) %>% 
+  mutate_all(~ifelse(is.na(.x), 
+                     mean(.x, na.rm = TRUE), .x)) %>% 
+  bind_cols(training %>%
+                dplyr::select(-all_of(protein_list))
+              ) %>%
+  na.omit()
+
+# relevel disease status
+testing$MS_disease_status = relevel(factor(testing$MS_disease_status),ref="control")
+
+# predict 
+predictions = predict(lasso_model,newdata = testing)
+predictions_for_roc = predict(lasso_model,newdata = testing,type = "prob")
+
+# performance 
+confusionMatrix(testing$MS_disease_status,predictions,positive = "prevalent")
+confusionMatrix(testing$MS_disease_status,predictions,positive = "prevalent", mode="prec_recall")
+
+
+
+```
+
+
+### MS-specific effects 
+```{r ms_specific}
+
+
+phenocols = c("MS_status",
+              "AD_status",
+              "PD_status",
+              "MND_status",
+              "SLE_status",
+              "CROHNS_status",
+              "UC_status",
+              "RA_status",
+              "COELIAC_status",
+              "AS_status",
+              "PSORIASIS_status")
+
+controls = filtered_pheno %>% filter(MS_status=="control")
+for(i in c(1:length(phenocols))){
+  run_limma(phenotype_col = phenocols[i], 
+            limma_dat = pheno %>%
+              filter(.data[[phenocols[i]]] == "prevalent" | EID %in% controls$EID), 
+            plot_prefix = "full",
+            model_spec = "primary")
+}
+
+
+# find results files
+res_files = paste0("/data/home/hmy117/ukb_proteomics/outputs//limma_results_full_",
+       phenocols,
+       ".csv")
+
+# read in 
+all_limma_res = purrr::map(res_files,function(x){
+  y = str_split_fixed(str_remove_all(x,"/data/home/hmy117/ukb_proteomics/outputs//limma_results_full_"),"_",2)[[1]][1]
+  read_csv(x) %>%
+    mutate(phenotype = y)
+})
+
+all_limma_res = do.call("bind_rows",all_limma_res)
+
+# cor plot 
+library(corrplot)
+corplot_dat = all_limma_res %>%
+  dplyr::select(phenotype,beta,protein) %>%
+  pivot_wider(id_cols = protein,names_from=phenotype,values_from = beta) %>%
+  data.frame()
+rownames(corplot_dat) = corplot_dat$protein
+corplot_dat = corplot_dat %>% dplyr::select(-protein)
+cormat = cor(corplot_dat)
+corp = corrplot::cor.mtest(cormat)
+
+cormat
+corp
+
+pheno_n = length(phenocols)
+tests_overall = 0
+for(i in c(pheno_n:0)){
+  tests_overall <<- tests_overall + (i - 1)
+}
+
+p_thresh = 0.05 / tests_overall
+
+png("~/ukb_proteomics/outputs/corr_plot.png",res=600,units="in",width=6,height=10)
+corrplot::corrplot(cormat, type = 'lower', order = 'hclust', tl.col = 'black',diag = F,
+                   cl.ratio = 0.2, tl.srt = 45, col = COL2('PuOr', 10), p.mat = corp$p,
+                   sig.level = c(p_thresh,0.05), pch.cex = 0.9,
+                   insig = 'label_sig')
+
+dev.off()
+
+
+# forest plot prevalent
+# read in primary analysis MS hits 
+ms_sig_prots = read_csv("~/ukb_proteomics/outputs/limma_results_filtered_MS_status.csv") %>% 
+  filter(bonf < 0.05) %>%
+  arrange(beta) %>%
+  mutate(phenotype="MS")
+ms_sig_limma = all_limma_res %>% 
+  filter(protein %in% ms_sig_prots$protein) %>%
+  filter(phenotype != "MS") %>%
+  bind_rows(ms_sig_prots)
+ms_sig_limma$protein = factor(
+  ms_sig_limma$protein,
+  levels = unique(ms_sig_prots$protein),
+  ordered = T
+) 
+ms_sig_limma$phenotype= relevel(factor(ms_sig_limma$phenotype),ref="MS")
+
+
+match_list = list()
+for(i in c(1:length(unique(ms_sig_limma$protein)))){
+  message(i)
+  this_prot = unique(ms_sig_limma$protein)[i]  
+  ms_sign = ms_sig_limma %>%
+    filter(protein == this_prot & phenotype=="MS") 
+  
+  matches = ms_sig_limma %>%
+    filter(phenotype != "MS" & 
+             protein == this_prot & 
+             pval < 0.1 & 
+             sign(beta) == sign(ms_sign$beta) )
+  spec = if(nrow(matches)>0){
+    " " 
+  } else {
+    "*"
+  }
+  match_list[[i]] = spec
+}
+
+ms_spec = data.frame(
+  protein = unique(ms_sig_limma$protein),
+  ms_specific = unlist(match_list)
+)
+
+
+ms_sig_limma_spec = ms_sig_limma %>%
+  distinct(protein) %>%
+  left_join(ms_spec,by="protein")
+
+ms_sig_limma = ms_sig_limma %>% left_join(ms_sig_limma_spec,by="protein")
+specific = ms_sig_limma %>% 
+  filter(ms_specific=="*" & phenotype=="MS")
+
+full_res_wide = ms_sig_limma %>% 
+  pivot_wider(id_cols = c(protein,ms_specific),values_from = c(beta,pval),names_from=phenotype)
+write_csv(full_res_wide,"~/ukb_proteomics/outputs/ms_limma_specific_hits_all_res.csv")
+
+write_csv(specific,"~/ukb_proteomics/outputs/ms_limma_specific_hits.csv")
+
+p = ggplot(ms_sig_limma,
+            aes(beta,protein,col=phenotype,label = ms_specific))+
+  geom_vline(xintercept=0,alpha=0.2,linetype="dashed")+
+  geom_point(position=ggstance::position_dodgev(height=0.5))+
+  theme_minimal()+
+  scale_color_brewer(palette="Paired")+
+  scale_x_continuous(limits=c(-0.75,0.75))+
+  geom_text(x=0.8,col="black")+
+  geom_tile(mapping = aes(x=0,protein,fill=protein),color="black",alpha=0.01,show.legend = F,width=1.5)+
+  scale_fill_manual(values=rep(c("blue","grey"),
+                               length(unique(ms_sig_limma$protein))/2+1))+
+  theme(panel.grid = element_blank())+
+  labs(x="Beta (effect of disease on protein level\nrelative to controls)",y="Protein",fill="Disease status")
+
+png("~/ukb_proteomics/outputs/comparison_plot_all_proteins.png",res=600,units="in",width=6,height=14)
+p
+dev.off()
+
+
+# just ms-specific 
+ms_sig_limma %>% filter(ms_specific=="*") %>% filter(phenotype=="MS") %>% arrange(desc(beta))
+p = ggplot(ms_sig_limma %>% filter(ms_specific=="*"),
+           aes(beta,protein,col=phenotype))+
+  geom_vline(xintercept=0,alpha=0.2,linetype="dashed")+
+  geom_point(position=ggstance::position_dodgev(height=0.5))+
+  theme_minimal()+
+  scale_color_brewer(palette="Paired")+
+  scale_x_continuous(limits=c(-0.75,0.75))+
+  geom_tile(mapping = aes(x=0,protein,fill=protein),color="black",alpha=0.01,show.legend = F,width=1.5)+
+  scale_fill_manual(values=rep(c("blue","grey"),
+                               length(unique(ms_sig_limma$protein))/2+1))+
+  theme(panel.grid = element_blank())+
+  labs(x="Beta (effect of disease on protein level\nrelative to controls)",y="Protein",fill="Disease status")
+
+p
+png("~/ukb_proteomics/outputs/comparison_plot.png",res=600,units="in",width=6,height=6)
+p
+dev.off()
+
+# CST5 plots
+  
+  make_plot = function(phenotype = "MS_status"){
+  plot_dat = pheno %>%
+    filter(.data[[phenotype]] %in% c("control","prevalent"))
+  p = ggplot(plot_dat,aes(CST5,fill=plot_dat[[phenotype]]))+
+  geom_density(alpha=0.5)+
+  theme_minimal()+
+    scale_fill_brewer(palette="Set1")+
+    labs(fill = phenotype)+
+    ggtitle(phenotype)
+  png(paste0("~/ukb_proteomics/outputs/",phenotype,"_cst5_plot.png"),res=600,units="in",width=4,height=4)
+  print(p)
+  dev.off()
+  }
+  
+
+make_plot("AD_status")
+make_plot("PD_status")
+make_plot("RA_status")
+make_plot("MS_status")
+
+
+# correlation with vitamin D
+
+p0=ggplot(filtered_pheno,
+       aes(vitamin_d_f30890_0_0,CST5))+
+  geom_point()+
+  geom_smooth(method="lm")+
+  theme_minimal()+
+  labs(y="Serum cystatin D",x="Serum vitamin D")
+
+p1=ggplot(filtered_pheno,
+       aes(MS_status,vitamin_d_f30890_0_0))+
+  geom_boxplot()+
+  scale_y_log10()+
+  theme_minimal()+
+  labs(x="MS status",y="Serum vitamin D")
+
+t.test(
+filtered_pheno[filtered_pheno$MS_status=="control",'vitamin_d_f30890_0_0'],
+filtered_pheno[filtered_pheno$MS_status=="prevalent",'vitamin_d_f30890_0_0']
+)
+
+gridExtra::grid.arrange(p0,p1,nrow=1)
+
+cor.test(filtered_pheno$vitamin_d_f30890_0_0,filtered_pheno$CST5,method="spearman")
+```
+
+## Analysis of MS severity (proxies)
+### Clean 'severity' phenotypes 
+
+```{r severity}
+# clean phenotypes
+filtered_pheno = filtered_pheno %>%
+  mutate(overall_health_rating_f2178_0_0 = case_when(
+    overall_health_rating_f2178_0_0 == "Prefer not to answer" ~ as.character(NA),
+    overall_health_rating_f2178_0_0 == "Do not know" ~ as.character(NA),
+    overall_health_rating_f2178_0_0 == "Excellent" ~ "Good_or_excellent",
+    overall_health_rating_f2178_0_0 == "Good" ~ "Good_or_excellent",
+    overall_health_rating_f2178_0_0 == "Fair" ~ "Fair_or_poor",
+    overall_health_rating_f2178_0_0 == "Poor" ~ "Fair_or_poor"))
+
+filtered_pheno = filtered_pheno %>%
+  mutate(longstanding_illness_disability_or_infirmity_f2188_0_0 = case_when(
+    longstanding_illness_disability_or_infirmity_f2188_0_0 == "Prefer not to answer" ~ as.character(NA),
+    longstanding_illness_disability_or_infirmity_f2188_0_0 == "Do not know" ~ as.character(NA),
+    longstanding_illness_disability_or_infirmity_f2188_0_0 == "No" ~ "healthy",
+    longstanding_illness_disability_or_infirmity_f2188_0_0 == "Yes" ~ "sick"))
+
+filtered_pheno = filtered_pheno %>%
+  mutate(falls_in_the_last_year_f2296_0_0 = case_when(
+    falls_in_the_last_year_f2296_0_0 == "Prefer not to answer" ~ as.character(NA),
+    falls_in_the_last_year_f2296_0_0 == "No falls" ~ "no_falls",
+    falls_in_the_last_year_f2296_0_0 == "Only one fall" ~ "falls",
+    falls_in_the_last_year_f2296_0_0 == "More than one fall" ~ "falls"))
+
+filtered_pheno = filtered_pheno %>%
+  mutate(normalised_t2_lesion_vol = total_volume_of_white_matter_hyperintensities_from_t1_and_t2_flair_images_f25781_2_0 / 
+        (volume_of_brain_greywhite_matter_normalised_for_head_size_f25009_2_0 +
+         volume_of_ventricular_cerebrospinal_fluid_normalised_for_head_size_f25003_2_0) )
+
+
+# plots 
+make_grouped_bar_plot("overall_health_rating_f2178_0_0")
+make_grouped_bar_plot("longstanding_illness_disability_or_infirmity_f2188_0_0")
+make_grouped_bar_plot("falls_in_the_last_year_f2296_0_0")
+make_grouped_density_plot("total_volume_of_white_matter_hyperintensities_from_t1_and_t2_flair_images_f25781_2_0")
+make_grouped_density_plot("normalised_t2_lesion_vol")
+make_grouped_density_plot("volume_of_brain_greywhite_matter_normalised_for_head_size_f25009_2_0")
+
+```
+### Regression models 
+```{r regression}
+
+# make function for regression
+
+run_limma2 = function(phenotype_col, limma_dat = pheno, plot_prefix = "full",reflevel, nonref){
+  dat = limma_dat %>% 
+    filter(MS_status=="prevalent") %>%
+    filter(!is.na(sex_f31_0_0) & !is.na(age_when_attended_assessment_centre_f21003_0_0) & !is.na(.data[[phenotype_col]]))
+  dat_just_proteins = dat %>% dplyr::select(all_of(protein_list))
+  
+  dat$agesq = dat$age_when_attended_assessment_centre_f21003_0_0^2 
+  
+  # set row names
+  rownames(dat_just_proteins) = dat$EID
+  
+  # mean imputation
+  dat_just_proteins = dat_just_proteins %>% 
+    mutate_all(~ifelse(is.na(.x), 
+                       mean(.x, na.rm = TRUE), .x))
+  # design 
+  dat[[phenotype_col]] = relevel(
+    factor(
+      as.character(dat[[phenotype_col]])
+    ),
+    ref = reflevel
+  )
+  table(dat[[phenotype_col]])
+  fmla1 = formula(
+    paste0("~0 + ",phenotype_col," + Batch + age_when_attended_assessment_centre_f21003_0_0 + sex_f31_0_0 + age_when_attended_assessment_centre_f21003_0_0:sex_f31_0_0 + agesq + agesq:sex_f31_0_0")
+  )
+  design <- model.matrix(fmla1, dat)
+  colnames(design) = str_remove_all(colnames(design),phenotype_col)
+  colnames(design)[ncol((design))-1]="agesex"
+  colnames(design)[ncol((design))]="agesq_sex"
+  fit = lmFit(t(dat_just_proteins), design) # fit model 
+  
+  contr_string = paste0("makeContrasts(",
+                    nonref,
+                    " - ", 
+                    reflevel,
+                    ",levels = design)"
+                    )
+  message(contr_string)
+  contr <- 
+   eval(parse(text=contr_string))
+   
+  tmp <- contrasts.fit(fit, contr) # Estimate contrast for each protein
+  tmp <- eBayes(tmp) # EB smooth
+  
+  
+  # process results
+  pvals = tmp$p.value %>%
+    data.frame() %>%
+    mutate(protein = rownames(tmp$p.value)) 
+  colnames(pvals) = c("pval","protein")
+  betas = tmp$coefficients %>%
+    data.frame() %>%
+    mutate(protein = rownames(tmp$coefficients))
+  colnames(betas) = c("beta","protein")
+  
+  overall_res = betas %>% left_join(pvals,by="protein") %>%
+    mutate(fdr = p.adjust(pval,method="fdr"),
+           bonf = p.adjust(pval,method="bonf")
+    )
+  
+  short_pheno = str_remove_all(phenotype_col,"_status")
+  plot_dat = overall_res %>%
+    mutate(sig = case_when(
+      bonf < 0.01 & beta > 0 ~ paste0("Up in ",short_pheno),
+      bonf < 0.01 & beta < 0 ~ paste0("Down in ",short_pheno),
+      bonf >= 0.01 ~ "NS"))
+  
+  counts = dat %>%
+    dplyr::count(.data[[phenotype_col]])
+  
+  plot_dat %>% arrange(pval)
+  p = ggplot(plot_dat,
+             aes(beta,-log10(pval),col = sig))+
+    geom_point()+
+    scale_color_manual(values = c("blue","grey","red"))+
+    theme_minimal()+
+    ggrepel::geom_text_repel(data = plot_dat %>% filter(bonf < 0.01),
+                             mapping = aes(beta, -log10(pval),label = protein),show.legend = F,force = 20)+
+    ggtitle(paste0("Prevalent ",
+                   short_pheno,
+                   "\n",
+                   counts[counts[[phenotype_col]]=="prevalent",]$n,
+                   " cases",
+                   "\n",
+                   counts[counts[[phenotype_col]]=="control",]$n,
+                   " controls"))+
+    labs(x="Beta coefficient",y = "-log10(P)",col="Direction")
+  p
+  
+  write_csv(overall_res,paste0("~/ukb_proteomics/outputs/limma_results_",plot_prefix,"_",phenotype_col,".csv"))
+  write_csv(overall_res %>%
+              filter(bonf < 0.05) %>%
+              arrange(desc(beta)),paste0("~/ukb_proteomics/outputs/sig_limma_results_",plot_prefix,"_",phenotype_col,".csv"))
+  
+  plotout = paste0("~/ukb_proteomics/outputs/limma_results_",plot_prefix,"_",phenotype_col,".png")
+  png(plotout,res=900,units="in",width=6,height=4)
+  
+  print(p)
+  dev.off()
+  print(p)
+  
+  
+}
+
+run_limma_no_contrast = function(phenotype_col, limma_dat = pheno, plot_prefix = "full",control_for_age_at_scan = F){
+  dat = limma_dat %>% 
+    filter(MS_status=="prevalent") %>%
+    filter(!is.na(sex_f31_0_0) & !is.na(age_when_attended_assessment_centre_f21003_0_0) & !is.na(.data[[phenotype_col]]))
+  dat_just_proteins = dat %>% dplyr::select(all_of(protein_list))
+  
+  dat$agesq = dat$age_when_attended_assessment_centre_f21003_0_0^2 
+  
+  # set row names
+  rownames(dat_just_proteins) = dat$EID
+  
+  # mean imputation
+  dat_just_proteins = dat_just_proteins %>% 
+    mutate_all(~ifelse(is.na(.x), 
+                       mean(.x, na.rm = TRUE), .x))
+  
+  # rank normalise 
+  hist(dat[[phenotype_col]],main="Raw")
+  dat[[phenotype_col]] = RNOmni::RankNorm(dat[[phenotype_col]])
+  hist(dat[[phenotype_col]],main="Normalised")
+
+  
+    fmla = formula(paste0("~0 + ",phenotype_col," + Batch + age_when_attended_assessment_centre_f21003_0_0 + sex_f31_0_0 + age_when_attended_assessment_centre_f21003_0_0:sex_f31_0_0 + agesq + agesq:sex_f31_0_0"))
+    fmla_alt=formula(paste0("~0 + ",phenotype_col," + Batch + age_when_attended_assessment_centre_f21003_2_0 + age_when_attended_assessment_centre_f21003_0_0 + sex_f31_0_0 + age_when_attended_assessment_centre_f21003_0_0:sex_f31_0_0 + agesq + agesq:sex_f31_0_0"))
+    
+    fmla1 = if(control_for_age_at_scan==FALSE){
+      fmla
+      } else {
+        fmla_alt
+      }
+  design <- model.matrix(fmla1, dat)
+  colnames(design)[ncol((design))-1]="agesex"
+  colnames(design)[ncol((design))]="agesq_sex"
+  fit = lmFit(t(dat_just_proteins), design) # fit model 
+  
+  tmp <- eBayes(fit) # EB smooth
+  
+  # process results
+  pvals = tmp$p.value %>%
+    data.frame() %>%
+    dplyr::select(all_of(phenotype_col)) %>%
+    mutate(protein = rownames(tmp$p.value)) 
+  colnames(pvals) = c("pval","protein")
+  betas = tmp$coefficients %>%
+    data.frame() %>%
+    dplyr::select(all_of(phenotype_col)) %>%
+    mutate(protein = rownames(tmp$coefficients))
+  colnames(betas) = c("beta","protein")
+  
+  overall_res = betas %>% left_join(pvals,by="protein") %>%
+    mutate(fdr = p.adjust(pval,method="fdr"),
+           bonf = p.adjust(pval,method="bonf")
+    )
+  
+  plot_dat = overall_res %>%
+    mutate(sig = case_when(
+      bonf < 0.01 & beta > 0 ~ "Up",
+      bonf < 0.01 & beta < 0 ~ "Down",
+      bonf >= 0.01 ~ "NS"))
+  
+  plot_dat %>% arrange(pval)
+  col_vec = c("blue","grey","red")
+  names(col_vec) = c("Down","NS","Up")
+  p = ggplot(plot_dat,
+             aes(beta,-log10(pval),col = sig))+
+    geom_point()+
+    scale_color_manual(values = col_vec)+
+    theme_minimal()+
+    ggrepel::geom_text_repel(data = plot_dat %>% filter(pval < 0.05),
+                             mapping = aes(beta, -log10(pval),label = protein),show.legend = F,force = 20)+
+    ggtitle(paste0(phenotype_col,"\nN = ",nrow(dat)))+
+    labs(x="Beta coefficient",y = "-log10(P)",col="Direction")+
+    geom_hline(yintercept = -log10(0.05/nrow(plot_dat)),alpha=0.5,linetype="dashed")
+  p
+  
+  # note this is nominal P < 0.05
+  
+  write_csv(overall_res,paste0("~/ukb_proteomics/outputs/limma_results_",plot_prefix,"_",phenotype_col,".csv"))
+  write_csv(overall_res %>%
+              filter(bonf < 0.05) %>%
+              arrange(desc(beta)),paste0("~/ukb_proteomics/outputs/sig_limma_results_",plot_prefix,"_",phenotype_col,".csv"))
+  
+  plotout = paste0("~/ukb_proteomics/outputs/limma_results_",plot_prefix,"_",phenotype_col,".png")
+  png(plotout,res=900,units="in",width=6,height=4)
+  
+  print(p)
+  dev.off()
+  print(p)
+  
+  
+}
+
+# run limma for categorical vars
+table(filtered_pheno$falls_in_the_last_year_f2296_0_0)
+run_limma2(phenotype_col = "falls_in_the_last_year_f2296_0_0",
+           limma_dat = filtered_pheno,
+           reflevel = "no_falls",
+           nonref = "falls")
+
+table(filtered_pheno$overall_health_rating_f2178_0_0)
+run_limma2(phenotype_col = "overall_health_rating_f2178_0_0",
+           limma_dat = filtered_pheno,
+           reflevel = "Good_or_excellent",
+           nonref = "Fair_or_poor")
+
+table(filtered_pheno$longstanding_illness_disability_or_infirmity_f2188_0_0)
+run_limma2(phenotype_col = "longstanding_illness_disability_or_infirmity_f2188_0_0",
+           limma_dat = filtered_pheno,
+           reflevel = "healthy",
+           nonref = "sick")
+
+
+run_limma_no_contrast(limma_dat = filtered_pheno,phenotype_col = "normalised_t2_lesion_vol")
+ggplot(filtered_pheno,
+       aes(MS_status,normalised_t2_lesion_vol,fill=MS_status))+
+  geom_boxplot()+
+  geom_jitter(alpha=0.1)+
+  scale_fill_brewer(palette="Set1")+
+  theme_minimal()+
+  labs(x="MS status",y="Normalised T2 lesion volume")
+  
+run_limma_no_contrast(limma_dat = filtered_pheno,phenotype_col = "total_volume_of_white_matter_hyperintensities_from_t1_and_t2_flair_images_f25781_2_0")
+run_limma_no_contrast(limma_dat = filtered_pheno,phenotype_col = "volume_of_brain_greywhite_matter_normalised_for_head_size_f25009_2_0")
+run_limma_no_contrast(limma_dat = filtered_pheno,phenotype_col = "R_Test1_PairsMatching_f399_cube_0")
+run_limma_no_contrast(limma_dat = filtered_pheno,phenotype_col = "R_Test2_ReactionTime_f20023_log_0")
+run_limma_no_contrast(limma_dat = filtered_pheno,phenotype_col = "R_Test3_ProspectiveMemory_f20018_bin_0")
+run_limma_no_contrast(limma_dat = filtered_pheno,phenotype_col = "R_Test4_FluidIntelligence_f20016_z_0")
+run_limma_no_contrast(limma_dat = filtered_pheno,phenotype_col = "R_Test5_NumericMemory_f4282_0")
+run_limma_no_contrast(limma_dat = filtered_pheno,phenotype_col = "age_at_ms")
+
+# adjust for age at scan 
+run_limma_no_contrast(limma_dat = filtered_pheno,phenotype_col = "normalised_t2_lesion_vol",control_for_age_at_scan = TRUE)
+                                                                                                                 
+# compare lesion volume 
+filtered_pheno %>%
+  group_by(MS_status) %>%
+  summarise(
+    median(total_volume_of_white_matter_hyperintensities_from_t1_and_t2_flair_images_f25781_2_0,na.rm=T),
+    IQR(total_volume_of_white_matter_hyperintensities_from_t1_and_t2_flair_images_f25781_2_0,na.rm=T),
+    median(normalised_t2_lesion_vol,na.rm = T))
+filtered_pheno %>%
+  filter(!is.na(normalised_t2_lesion_vol)) %>%
+  dplyr::count(MS_status)
+
+wilcox.test(filtered_pheno[filtered_pheno$MS_status=="control",][["total_volume_of_white_matter_hyperintensities_from_t1_and_t2_flair_images_f25781_2_0"]],
+             filtered_pheno[filtered_pheno$MS_status=="prevalent",][["total_volume_of_white_matter_hyperintensities_from_t1_and_t2_flair_images_f25781_2_0"]])
+
+```
+
+
+## GSEA
+```{r gsea}
+library(tidyverse)
+
+
+# read in DE proteins 
+de = read_csv("~/ukb_proteomics/outputs/limma_results_filtered_MS_status.csv")
+
+# sort in descending order 
+de_sorted = de %>%
+  mutate(rank = sign(beta) * -log10(pval)) %>%
+  arrange(desc(rank))
+
+# create gene list 
+protein_list = de_sorted$rank
+names(protein_list) = de_sorted$protein
+
+# fgsea 
+library(msigdbr)
+library(fgsea)
+
+# get gene sets
+kegg_gene_sets = msigdbr(species = "Homo sapiens", category = "C2") %>% filter(gs_subcat=="CP:KEGG")
+kegg_list = split(x = kegg_gene_sets$gene_symbol, f = kegg_gene_sets$gs_name)
+
+
+gsea_res_kegg = fgseaMultilevel(pathways = kegg_list,
+      stats = protein_list,
+      minSize = 15, 
+      maxSize = 500, 
+      eps = 0, 
+      nPermSimple = 10000)
+
+gsea_res_kegg %>%
+  arrange(padj)
+
+# plot 
+plot_dat = gsea_res_kegg %>%
+  filter(pval < 0.05) %>%
+  mutate(pathway = str_remove_all(pathway,"KEGG_")) %>%
+  mutate(pathway = str_replace_all(pathway,"_"," ")) %>%
+  arrange((NES)) %>%
+  mutate(sig = ifelse(padj < 0.05,"*"," "))
+plot_dat$pathway=factor(plot_dat$pathway,levels=plot_dat$pathway,ordered=T)
+
+ggplot(plot_dat,
+       aes(NES,pathway,fill=NES,label=sig))+
+  geom_col(color="black")+
+  geom_text(size=5,hjust=1)+
+  scale_fill_gradient2(low="purple",high="orange2",midpoint=0)+
+  theme_minimal()+
+  labs(x="Normalised enrichment score (NES)",y="Pathway (KEGG)",fill="NES")
+
+
+leading_edge_proteins = gsea_res_kegg[gsea_res_kegg$pathway=="KEGG_JAK_STAT_SIGNALING_PATHWAY",]$leadingEdge[[1]]
+for(protein in leading_edge_proteins){
+
+  sum = filtered_pheno %>%
+    group_by(MS_status) %>%
+    summarise(median = median(.data[[protein]],na.rm=T))
+  direction_in_ms = ifelse(
+      sum[sum$MS_status=="control",]$median > sum[sum$MS_status=="prevalent",]$median,
+      "Down in MS",
+      "Up in MS"
+  )
+  sum[[paste0("median_",protein)]] = sum$median
+
+  print(sum %>% dplyr::select(-median))
+  
+  p=ggplot(filtered_pheno,
+         aes(MS_status,.data[[protein]],fill=MS_status))+
+    geom_jitter(alpha=0.2)+
+           geom_boxplot(alpha=0.5)+
+    ggtitle(paste0(protein,": ",direction_in_ms))
+  print(p)
+}
+```
+
+## Explore severity GWAS hit
+```{r sev_gwas}
+# find rs10191329 carriers
+
+cmd = paste0(
+  "~/plink2 --pfile /data/Wolfson-PNU-dementia/UKB/imputed_genotypes/plink2_files/chr_2 ",
+  "--snp rs10191329 ",
+  "--recode AD ",
+  "--out dysf_snp_carriers"
+)
+system(cmd)
+
+# read in 
+dysf_carriers = read_table("dysf_snp_carriers.raw")
+
+filtered_pheno = filtered_pheno %>%
+  left_join(dysf_carriers %>%
+              dplyr::select(IID,rs10191329_A,rs10191329_HET) %>%
+              dplyr::rename("EID" = IID),
+            by="EID")
+
+# look at genotypes 
+ggplot(filtered_pheno,aes(rs10191329_A))+geom_histogram()
+
+# round to hard calls
+filtered_pheno$rs10191329_A_hardcall = round(filtered_pheno$rs10191329_A,0)
+ggplot(filtered_pheno,aes(rs10191329_A_hardcall))+geom_histogram()
+
+ggplot(filtered_pheno %>%
+         filter(!is.na(rs10191329_A_hardcall)),
+       aes(MS_status,fill=factor(rs10191329_A_hardcall)))+
+  geom_bar(position="fill",color="black")+
+  scale_fill_brewer(palette="Set1")
+
+# association with MRI metrics
+ggplot(
+  filtered_pheno %>%
+    filter(MS_status == "prevalent" & !is.na(normalised_t2_lesion_vol) & !is.na(rs10191329_A_hardcall)),
+  aes(factor(rs10191329_A_hardcall),normalised_t2_lesion_vol)
+)+geom_boxplot()+
+  geom_point()
+
+ggplot(
+  filtered_pheno %>%
+    filter(MS_status == "prevalent" & !is.na(volume_of_brain_greywhite_matter_normalised_for_head_size_f25009_2_0) & !is.na(rs10191329_A_hardcall)),
+  aes(factor(rs10191329_A_hardcall),volume_of_brain_greywhite_matter_normalised_for_head_size_f25009_2_0)
+)+geom_boxplot()+
+  geom_point()
+
+ggplot(
+  filtered_pheno %>%
+    filter(!is.na(NEFL) & !is.na(rs10191329_A_hardcall)),
+  aes(factor(rs10191329_A_hardcall),NEFL)
+)+geom_boxplot()+
+  geom_point()
+
+
+
+```
+
+## GWAS
+```{r nfl_gwas}
+
+# export NFL data
+ms_nfl = filtered_pheno %>%
+  filter(MS_status=="prevalent" & genetic_ethnic_grouping_f22006_0_0.x == "Caucasian") %>%
+  dplyr::rename("IID" = EID) %>%
+  mutate(FID = IID) %>%
+  dplyr::select(FID,
+                IID,
+                NEFL,
+                age_at_recruitment_f21022_0_0,
+                sex_f31_0_0,
+                paste0("PC",seq(1,20,by=1)),
+                paste0("genetic_principal_components_f22009_0_",seq(1,20,by=1))) %>%
+  filter(!is.na(NEFL))
+
+# split into pheno and covar
+ms_nfl_pheno = ms_nfl %>% dplyr::select(FID,IID,NEFL)
+ms_nfl_pheno$NEFL = RNOmni::RankNorm(ms_nfl_pheno$NEFL)
+ms_nfl_covar = ms_nfl %>% dplyr::select(-NEFL)
+write_tsv(ms_nfl_pheno,"../outputs/ms_nfl_pheno.tsv")
+write_tsv(ms_nfl_covar,"../outputs/ms_nfl_covar.tsv")
+
+# run gwas 
+# system("qsub ../scripts/nfl_gwas.sh")
+
+# read GWAS results
+gwas = list()
+for(i in c(1:22)){
+  file = paste0("~/ukb_proteomics/outputs/nfl_gwas_chrom_",i,".NEFL.glm.linear")
+  gwas[[i]] = read_table2(file)
+}
+gwas = do.call("bind_rows",gwas)
+
+# qq plot
+qqman::qq(gwas$P)
+
+# manhattan
+gwas_for_plot = gwas %>%
+  filter(P < 0.1 & !is.na(P)) %>%
+  dplyr::rename("CHR"=`#CHROM`,"BP"=POS,"SNP"=ID)
+qqman::manhattan(gwas_for_plot,
+                  col = c("blue4", "orange3"),annotatePval = 1e-5,annotateTop = T)
+
+# dysf locus plot 
+
+gwas = gwas %>% 
+  dplyr::rename("CHR"=`#CHROM`,"BP"=POS,"SNP"=ID) 
+
+qqman::manhattan(subset(gwas,CHR == 2 & BP > (71676999 - 1e6) & BP < (71676999 + 1e6)))
+
+sigsnps = gwas %>%
+  filter(ID %in% c("rs10191329","rs149097173"))
+sigsnps %>% dplyr::select(-ERRCODE,-T_STAT,-TEST,-REF)
+gwas %>% arrange(P) %>% head(20) %>% dplyr::select(ID,P)
+
+
+```
+
